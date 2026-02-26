@@ -1,12 +1,12 @@
 import json
 import re
 import unicodedata
+import asyncio
 import pdfplumber
 import nltk
 from nltk.tokenize import sent_tokenize
 from dateutil.parser import parse
 from dateutil.parser import ParserError
-from spellchecker import SpellChecker
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import google.generativeai as genai
@@ -15,6 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 from dotenv import load_dotenv
 import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from concurrent.futures import ThreadPoolExecutor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -35,7 +37,6 @@ model = genai.GenerativeModel("gemini-2.5-flash")
 
 
 def normalize_unicode(text):
-    """Normalizes Unicode characters and removes non-printable/control characters."""
     normalized_text = unicodedata.normalize('NFKC', text)
     cleaned_chars = [
         char for char in normalized_text
@@ -47,14 +48,12 @@ def normalize_unicode(text):
 
 
 def normalize_dates(text):
-    """Identifies and normalizes various date formats in the text to 'YYYY-MM-DD'."""
     date_pattern = re.compile(
         r'\b(?:\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|' +
         r'\d{1,2}\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s\d{4}|' +
         r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s\d{1,2},?\s\d{4})\b',
         re.IGNORECASE
     )
-
     def replace_date(match):
         date_str = match.group(0)
         try:
@@ -62,12 +61,10 @@ def normalize_dates(text):
             return parsed_date.strftime('%Y-%m-%d')
         except ParserError:
             return date_str
-
     return date_pattern.sub(replace_date, text)
 
 
 def remove_ocr_garbage(text):
-    """Removes common OCR garbage such as isolated characters, repeated characters, and non-alphanumeric sequences."""
     cleaned_text = text
     cleaned_text = re.sub(r'\s[a-zA-Z0-9]\s', ' ', cleaned_text)
     cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
@@ -79,45 +76,20 @@ def remove_ocr_garbage(text):
 
 
 def normalize_whitespace(text):
-    """Normalizes whitespace in the text."""
     cleaned_text = re.sub(r'\s+', ' ', text)
     cleaned_text = cleaned_text.strip()
     cleaned_text = cleaned_text.replace('\r\n', '\n').replace('\r', '\n')
     return cleaned_text
 
 
-def correct_spelling(text, language='en'):
-    """Corrects spelling mistakes in the text using a spell checker."""
-    spell = SpellChecker(language=language)
-    corrected_words = []
-    words = re.findall(r'\b\w+\b|\S', text)
-    for word in words:
-        if re.match(r'^\w+$', word):
-            corrected_word = spell.correction(word)
-            if corrected_word is not None:
-                corrected_words.append(corrected_word)
-            else:
-                corrected_words.append(word)
-        else:
-            corrected_words.append(word)
-    return ' '.join(corrected_words)
-
 
 def apply_adaptive_semantic_window(text):
-    """Applies an adaptive semantic window by splitting text into sentences."""
     sentences = sent_tokenize(text)
     return sentences
 
 
 def preprocess_pdf(pdf_path: str) -> str:
-    """
-    Full preprocessing pipeline for a single PDF.
-    Extracts text and runs all cleaning steps.
-    Returns the final cleaned text as a single string.
-    """
     print(f'\nProcessing {pdf_path}...')
-
-    # 1. Extract text
     pdf_text = ''
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
@@ -125,37 +97,22 @@ def preprocess_pdf(pdf_path: str) -> str:
             if extracted:
                 pdf_text += extracted + '\n'
     print(f"  Extracted text length: {len(pdf_text)} characters")
-
-    # 2. Unicode normalization
     processed = normalize_unicode(pdf_text)
     print(f"  After Unicode normalization: {len(processed)} characters")
-
-    # 3. Date normalization
     processed = normalize_dates(processed)
     print(f"  After Date normalization: {len(processed)} characters")
-
-    # 4. OCR garbage removal
     processed = remove_ocr_garbage(processed)
     print(f"  After OCR garbage removal: {len(processed)} characters")
-
-    # 5. Whitespace normalization
     processed = normalize_whitespace(processed)
     print(f"  After Whitespace normalization: {len(processed)} characters")
-
-    # 6. Spelling correction
-    processed = correct_spelling(processed)
-    print(f"  After Spelling correction: {len(processed)} characters")
-
-    # 7. Adaptive semantic window (sentence tokenization)
+    print(f"  Spelling correction skipped (not effective on Hindi text)")
     sentences = apply_adaptive_semantic_window(processed)
     print(f"  After Adaptive semantic window: {len(sentences)} sentences")
-
-    # Join sentences back with newline
     final_text = '\n'.join(sentences)
     return final_text
 
 
-
+# ── Schema ────────────────────────────────────────────────────────────────────
 
 class CaseExtraction(BaseModel):
     fir_number:       Optional[str] = Field(None)
@@ -235,6 +192,7 @@ CHECKLISTS = {
 }
 
 
+
 SYSTEM_PROMPT = """
 You are a legal extraction engine for Indian police chargesheets written in Hindi.
 RULES:
@@ -246,29 +204,199 @@ RULES:
 FIR NUMBER RULE:
 - Only extract fir_number if text explicitly says FIR or प्रथम सूचना रिपोर्ट.
 - If unsure, return null.
+
+CONFIDENCE SCORING RULES (Stage 3A):
+- Return a confidence score (0.0-1.0) for every field.
+- High confidence (>0.85): value is explicitly and unambiguously stated in text.
+- Medium confidence (0.5-0.85): value is stated but with some ambiguity.
+- Low confidence (<0.5): value is inferred, partial, or unclear.
+- Scores must NOT all be 1.0 — reflect actual certainty from the text.
+
 OUTPUT FORMAT:
 {
-  "fir_number": string or null,
-  "fir_date": string or null,
-  "police_station": string or null,
-  "accused_names": [],
-  "victim_names": [],
-  "legal_sections": [],
-  "incident_summary": string or null
+  "fir_number":       { "value": string or null, "confidence": float },
+  "fir_date":         { "value": string or null, "confidence": float },
+  "police_station":   { "value": string or null, "confidence": float },
+  "accused_names":    { "value": [],             "confidence": float },
+  "victim_names":     { "value": [],             "confidence": float },
+  "legal_sections":   { "value": [],             "confidence": float },
+  "incident_summary": { "value": string or null, "confidence": float }
+}
+
+--- FEW-SHOT EXAMPLE 1 (clear, complete input — high confidence) ---
+Input:
+प्रथम सूचना रिपोर्ट संख्या 123/2024, दिनांक 15/03/2024
+थाना: कोतवाली नगर
+अभियुक्त: राम कुमार पुत्र श्याम कुमार
+पीड़ित: सीता देवी
+धारा: IPC 379, IPC 411
+घटना विवरण: दिनांक 14/03/2024 को रात्रि 10 बजे अभियुक्त राम कुमार ने पीड़ित सीता देवी का मोबाइल फोन चुरा लिया।
+
+Output:
+{
+  "fir_number":       { "value": "123/2024",               "confidence": 0.97 },
+  "fir_date":         { "value": "15/03/2024",              "confidence": 0.95 },
+  "police_station":   { "value": "कोतवाली नगर",             "confidence": 0.93 },
+  "accused_names":    { "value": ["राम कुमार"],              "confidence": 0.91 },
+  "victim_names":     { "value": ["सीता देवी"],              "confidence": 0.90 },
+  "legal_sections":   { "value": ["IPC 379", "IPC 411"],    "confidence": 0.95 },
+  "incident_summary": { "value": "दिनांक 14/03/2024 को रात्रि 10 बजे अभियुक्त राम कुमार ने पीड़ित सीता देवी का मोबाइल फोन चुरा लिया।", "confidence": 0.92 }
+}
+
+--- FEW-SHOT EXAMPLE 2 (ambiguous/incomplete input — low confidence) ---
+Input:
+काण्ड संख्या 456/2024
+किसी अज्ञात व्यक्ति द्वारा मारपीट की गई। पीड़ित का नाम अस्पष्ट है।
+धारा लागू की जा सकती है।
+
+Output:
+{
+  "fir_number":       { "value": null,   "confidence": 0.10 },
+  "fir_date":         { "value": null,   "confidence": 0.10 },
+  "police_station":   { "value": null,   "confidence": 0.10 },
+  "accused_names":    { "value": [],     "confidence": 0.10 },
+  "victim_names":     { "value": [],     "confidence": 0.20 },
+  "legal_sections":   { "value": [],     "confidence": 0.15 },
+  "incident_summary": { "value": "अज्ञात व्यक्ति द्वारा मारपीट की घटना। विवरण अपूर्ण।", "confidence": 0.35 }
 }
 """
 
-def extract_case_details(text: str) -> CaseExtraction:
+
+CHECKLIST_PROMPT = """
+You are auditing an Indian police chargesheet.
+For EACH required item below, check if it is present in the case text.
+Return a JSON array ONLY. No markdown, no explanation.
+Each element must have four fields: item, status, detail, confidence.
+- status: one of PRESENT, MISSING, PARTIAL
+- confidence (Stage 3A): float 0.0-1.0 — how certain you are about this status.
+  Use low confidence when evidence is indirect or ambiguous.
+  Use high confidence only when item is clearly and explicitly present or absent.
+  Scores must NOT all be 1.0.
+
+--- FEW-SHOT EXAMPLE 1 ---
+Required items: ["FIR number and date", "Witness statements"]
+Case text: "FIR No. 55/2024 dated 01/04/2024 registered at PS Kotwali. No witness was present at the scene."
+Output:
+[
+  {"item": "FIR number and date", "status": "PRESENT", "detail": "FIR No. 55/2024 dated 01/04/2024 explicitly stated.", "confidence": 0.96},
+  {"item": "Witness statements",  "status": "MISSING", "detail": "Text explicitly states no witness was present.", "confidence": 0.91}
+]
+
+--- FEW-SHOT EXAMPLE 2 (partial/ambiguous) ---
+Required items: ["Medical Legal Case (MLC) report", "Arrest memo (if arrested)"]
+Case text: "पीड़ित को अस्पताल भेजा गया। अभियुक्त को हिरासत में लिया गया।"
+Output:
+[
+  {"item": "Medical Legal Case (MLC) report", "status": "PARTIAL", "detail": "पीड़ित को अस्पताल भेजा गया — MLC का उल्लेख नहीं, केवल अस्पताल जाने का जिक्र।", "confidence": 0.55},
+  {"item": "Arrest memo (if arrested)",       "status": "PARTIAL", "detail": "हिरासत में लिया गया — लेकिन औपचारिक गिरफ्तारी मेमो का उल्लेख नहीं।",      "confidence": 0.50}
+]
+
+Required items:
+ITEMS_PLACEHOLDER
+
+Case text:
+TEXT_PLACEHOLDER
+"""
+
+
+
+def _compute_classification_confidence(scores: dict, best_match: str) -> float:
+    """
+    Meaningful numeric confidence for crime classification (0.0-1.0).
+    Combines section coverage ratio and separation margin from second-best.
+    """
+    if not scores:
+        return 0.0
+    total_typical = len(CHECKLISTS[best_match].get("typical_sections", []))
+    match_count   = scores[best_match]
+    coverage      = match_count / total_typical if total_typical > 0 else 0.0
+    sorted_scores = sorted(scores.values(), reverse=True)
+    if len(sorted_scores) >= 2:
+        margin = (sorted_scores[0] - sorted_scores[1]) / max(sorted_scores[0], 1)
+    else:
+        margin = 1.0
+    confidence = round((coverage * 0.6) + (margin * 0.4), 3)
+    return min(confidence, 1.0)
+
+
+def _add_checklist_confidence_from_semantic(
+    llm_checklist: list,
+    sem_checklist: list
+) -> list:
+    """
+    Stage 3A: Blends LLM checklist status with semantic similarity score
+    to produce a meaningful, non-binary per-item confidence.
+    Formula: 60% LLM status base + 40% semantic similarity score.
+    """
+    sem_map     = {item["item"]: item["similarity_score"] for item in sem_checklist}
+    status_base = {"PRESENT": 0.75, "PARTIAL": 0.45, "MISSING": 0.10}
+
+    for item in llm_checklist:
+        existing_conf = item.get("confidence")
+        if existing_conf is None or existing_conf in (0.75, 0.45, 0.10):
+            base      = status_base.get(item.get("status", "MISSING"), 0.10)
+            sim_score = sem_map.get(item.get("item", ""), 0.0)
+            item["confidence"] = round(min((base * 0.6) + (sim_score * 0.4), 1.0), 3)
+
+    return llm_checklist
+
+
+
+def extract_case_details(text: str) -> tuple:
+    """
+    Stage 3B: Uses few-shot prompt for extraction.
+    Stage 3A: Returns per-field confidence scores alongside extracted values.
+    Returns (CaseExtraction, summary_confidence_dict).
+    """
     try:
         prompt = f"{SYSTEM_PROMPT}\n\nExtract from this chargesheet:\n\n{text}\n\nReturn ONLY JSON."
         response = model.generate_content(prompt, generation_config={"temperature": 0})
         raw = response.text.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1].replace("json", "").strip()
-        return CaseExtraction.model_validate_json(raw)
+
+        parsed = json.loads(raw)
+
+        def get_val(key):
+            entry = parsed.get(key, {})
+            if isinstance(entry, dict):
+                return entry.get("value")
+            return entry
+
+        def get_conf(key):
+            entry = parsed.get(key, {})
+            if isinstance(entry, dict):
+                return round(float(entry.get("confidence", 0.5)), 3)
+            return 0.5
+
+        extraction = CaseExtraction(
+            fir_number       = get_val("fir_number"),
+            fir_date         = get_val("fir_date"),
+            police_station   = get_val("police_station"),
+            accused_names    = get_val("accused_names") or [],
+            victim_names     = get_val("victim_names") or [],
+            legal_sections   = get_val("legal_sections") or [],
+            incident_summary = get_val("incident_summary"),
+        )
+
+        summary_confidence = {
+            "fir_number":       get_conf("fir_number"),
+            "fir_date":         get_conf("fir_date"),
+            "police_station":   get_conf("police_station"),
+            "accused_names":    get_conf("accused_names"),
+            "victim_names":     get_conf("victim_names"),
+            "legal_sections":   get_conf("legal_sections"),
+            "incident_summary": get_conf("incident_summary"),
+        }
+
+        return extraction, summary_confidence
+
     except Exception as e:
         print(f"[ERROR] Extraction failed: {e}")
-        return CaseExtraction()
+        return CaseExtraction(), {k: 0.0 for k in [
+            "fir_number", "fir_date", "police_station",
+            "accused_names", "victim_names", "legal_sections", "incident_summary"
+        ]}
 
 
 FIR_POSITIVE = [
@@ -390,7 +518,6 @@ def normalize(extraction: CaseExtraction) -> CaseExtraction:
         extraction.incident_summary = re.sub(r'\s{2,}', ' ', extraction.incident_summary).strip()
     return extraction
 
-# ── Classification ────────────────────────────────────────────────────────────
 
 def match_section(extracted: str, typical: str) -> bool:
     extracted = extracted.upper().strip()
@@ -404,6 +531,7 @@ def classify_crime(legal_sections: List[str]) -> dict:
             "display_name": "Unknown",
             "reason": "No legal sections extracted",
             "confidence": "LOW",
+            "classification_confidence": 0.0,
             "matched_sections": []
         }
     scores = {}
@@ -425,42 +553,31 @@ def classify_crime(legal_sections: List[str]) -> dict:
             "display_name": "Unknown",
             "reason": f"No matching sections found for: {legal_sections}",
             "confidence": "LOW",
+            "classification_confidence": 0.0,
             "matched_sections": []
         }
     best_match  = max(scores, key=scores.get)
     match_count = scores[best_match]
     total       = len(CHECKLISTS[best_match].get("typical_sections", []))
+
     if match_count >= 2:
         confidence = "HIGH"
     elif match_count == 1:
         confidence = "MEDIUM"
     else:
         confidence = "LOW"
+
+    classification_confidence = _compute_classification_confidence(scores, best_match)
+
     return {
-        "crime_type":       best_match,
-        "display_name":     CHECKLISTS[best_match]["display_name"],
-        "confidence":       confidence,
-        "matched_sections": matched_map[best_match],
-        "reason":           f"{match_count} of {total} typical sections matched"
+        "crime_type":                best_match,
+        "display_name":              CHECKLISTS[best_match]["display_name"],
+        "confidence":                confidence,
+        "classification_confidence": classification_confidence,
+        "matched_sections":          matched_map[best_match],
+        "reason":                    f"{match_count} of {total} typical sections matched"
     }
 
-
-CHECKLIST_PROMPT = """
-You are auditing an Indian police chargesheet.
-For EACH required item below, check if it is present in the case text.
-Return a JSON array ONLY. No markdown, no explanation.
-Each element must have three fields: item, status, detail.
-status must be one of: PRESENT, MISSING, PARTIAL.
-PRESENT means clearly found in the text.
-MISSING means not found at all.
-PARTIAL means mentioned but incomplete.
-
-Required items:
-ITEMS_PLACEHOLDER
-
-Case text:
-TEXT_PLACEHOLDER
-"""
 
 def run_checklist_audit(text: str, crime_key: str) -> list:
     if crime_key == "UNKNOWN" or crime_key not in CHECKLISTS:
@@ -476,8 +593,12 @@ def run_checklist_audit(text: str, crime_key: str) -> list:
             raw = raw.split("```")[1].replace("json", "").strip()
         results = json.loads(raw)
         emoji_map = {"PRESENT": "✅", "MISSING": "❌", "PARTIAL": "⚠️"}
+        status_base = {"PRESENT": 0.75, "PARTIAL": 0.45, "MISSING": 0.10}
         for item in results:
             item["label"] = emoji_map.get(item["status"], "❓")
+            # Fallback confidence if LLM omits it
+            if "confidence" not in item:
+                item["confidence"] = status_base.get(item.get("status", "MISSING"), 0.10)
         return results
     except Exception as e:
         print(f"[ERROR] Checklist audit failed: {e}")
@@ -527,7 +648,6 @@ OUTPUT FORMAT:
 """
 
 def run_ner(text: str) -> list:
-    """Runs the NER layer on chargesheet text and returns a list of entities."""
     try:
         prompt = f"{NER_PROMPT}\n\nChargesheet text:\n\n{text[:8000]}\n\nReturn ONLY JSON."
         response = model.generate_content(prompt, generation_config={"temperature": 0})
@@ -536,8 +656,6 @@ def run_ner(text: str) -> list:
             raw = raw.split("```")[1].replace("json", "").strip()
         data = json.loads(raw)
         entities = data.get("entities", [])
-
-        # Post-process: deduplicate by (text, type)
         seen = set()
         deduped = []
         for entity in entities:
@@ -545,24 +663,19 @@ def run_ner(text: str) -> list:
             if key not in seen:
                 seen.add(key)
                 deduped.append(entity)
-
         return deduped
     except Exception as e:
         print(f"[ERROR] NER failed: {e}")
         return []
 
 
-SIMILARITY_THRESHOLD = 0.65  # Minimum cosine similarity to count as PRESENT
-PARTIAL_THRESHOLD    = 0.40  # Between this and SIMILARITY_THRESHOLD → PARTIAL
+SIMILARITY_THRESHOLD = 0.65
+PARTIAL_THRESHOLD    = 0.40
 
 def _get_embeddings_tfidf(required_items: List[str], sentences: List[str]):
-    """
-    Fits a TF-IDF vectorizer on required_items + sentences together so both
-    share the same vocabulary, then returns separate matrices.
-    """
     corpus = required_items + sentences
     vectorizer = TfidfVectorizer(
-        analyzer="char_wb",   # character n-grams — handles Hindi + mixed text better
+        analyzer="char_wb",
         ngram_range=(2, 4),
         min_df=1,
         sublinear_tf=True
@@ -573,50 +686,31 @@ def _get_embeddings_tfidf(required_items: List[str], sentences: List[str]):
     return items_matrix, sentences_matrix
 
 def run_semantic_checklist(text: str, crime_key: str) -> list:
-    """
-    Augments the keyword checklist with TF-IDF cosine similarity scoring.
-    For each required checklist item:
-      - Finds the most similar sentence in the chargesheet
-      - Assigns PRESENT / PARTIAL / MISSING based on similarity score
-      - Returns the top matching sentence for PRESENT/PARTIAL items
-    Output format matches the minimum spec:
-      { item, status, similarity_score, matched_text, label }
-    """
     if crime_key == "UNKNOWN" or crime_key not in CHECKLISTS:
         return []
-
     required_items = CHECKLISTS[crime_key]["required_items"]
-
-    
     sentences = [s.strip() for s in text.split("\n") if s.strip()]
-    
     if len(sentences) < 3:
         sentences = [s.strip() for s in re.split(r'[।.!?]', text) if s.strip()]
     if not sentences:
         return []
-
     try:
         items_matrix, sentences_matrix = _get_embeddings_tfidf(required_items, sentences)
-
         sim_matrix = cosine_similarity(items_matrix, sentences_matrix)
-
         emoji_map = {"PRESENT": "✅", "MISSING": "❌", "PARTIAL": "⚠️"}
         results = []
-
         for idx, item in enumerate(required_items):
-            scores        = sim_matrix[idx]          
-            best_idx      = int(np.argmax(scores))
-            best_score    = float(scores[best_idx])
-            matched_text  = sentences[best_idx]
-
+            scores       = sim_matrix[idx]
+            best_idx     = int(np.argmax(scores))
+            best_score   = float(scores[best_idx])
+            matched_text = sentences[best_idx]
             if best_score >= SIMILARITY_THRESHOLD:
                 status = "PRESENT"
             elif best_score >= PARTIAL_THRESHOLD:
                 status = "PARTIAL"
             else:
                 status       = "MISSING"
-                matched_text = ""         
-
+                matched_text = ""
             results.append({
                 "item":             item,
                 "status":           status,
@@ -624,48 +718,48 @@ def run_semantic_checklist(text: str, crime_key: str) -> list:
                 "matched_text":     matched_text,
                 "label":            emoji_map.get(status, "❓")
             })
-
         return results
-
     except Exception as e:
         print(f"[ERROR] Semantic checklist failed: {e}")
         return []
 
 
 def analyze_chargesheet(text: str) -> dict:
-    extraction = extract_case_details(text)
+    extraction, summary_confidence = extract_case_details(text)
     extraction = normalize(extraction)
     extraction.fir_number = validate_fir_number(extraction.fir_number, text)
     classification = classify_crime(extraction.legal_sections)
-    crime_key  = classification["crime_type"]
-    checklist  = run_checklist_audit(text, crime_key)       # Stage 1 — LLM keyword audit (unchanged)
-    sem_checklist = run_semantic_checklist(text, crime_key) # Stage 2B — Semantic similarity
-    entities   = run_ner(text)                              # Stage 2A — NER
+    crime_key = classification["crime_type"]
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_checklist     = executor.submit(run_checklist_audit, text, crime_key)
+        future_sem_checklist = executor.submit(run_semantic_checklist, text, crime_key)
+        future_ner           = executor.submit(run_ner, text)
+        checklist     = future_checklist.result()
+        sem_checklist = future_sem_checklist.result()
+        entities      = future_ner.result()
+
+    checklist = _add_checklist_confidence_from_semantic(checklist, sem_checklist)
+
     return {
-        "output_a_case_summary":      extraction.model_dump(),
-        "output_b_classification":    classification,
-        "output_c_checklist":         checklist,
+        "output_a_case_summary": {
+            **extraction.model_dump(),
+            "field_confidence": summary_confidence
+        },
+        "output_b_classification":      classification,
+        "output_c_checklist":           checklist,
         "output_c2_semantic_checklist": {"checklist": sem_checklist},
-        "output_d_entities":          {"entities": entities}
+        "output_d_entities":            {"entities": entities}
     }
 
 
 
 def process_pdf_and_analyze(pdf_path: str, save_txt_path: Optional[str] = None) -> dict:
-    """
-    End-to-end pipeline:
-      1. Preprocess the PDF (clean text)
-      2. Optionally save cleaned text to a .txt file
-      3. Run chargesheet analysis on the cleaned text
-      Returns the full analysis result dict.
-    """
     cleaned_text = preprocess_pdf(pdf_path)
-
     if save_txt_path:
         with open(save_txt_path, 'w', encoding='utf-8') as f:
             f.write(cleaned_text)
         print(f"  Cleaned text saved to '{save_txt_path}'")
-
     print(f"  Running chargesheet analysis...")
     result = analyze_chargesheet(cleaned_text)
     print(f"  Analysis complete.")
@@ -686,12 +780,12 @@ def home():
     return {"status": "Chargesheet Analyzer API is running"}
 
 @app.post("/analyze-chargesheet")
-def analyze(request: AnalyzeRequest):
-    """Accepts pre-extracted text and runs the analysis pipeline."""
+async def analyze(request: AnalyzeRequest):
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
     try:
-        result = analyze_chargesheet(request.text)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, analyze_chargesheet, request.text)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -704,7 +798,6 @@ if __name__ == "__main__":
         {"pdf": "/content/Case Diary-238.pdf",  "txt": "2.txt"},
         {"pdf": "/content/Case Diary-456.pdf",  "txt": "3.txt"},
     ]
-
     all_results = {}
     for job in pdf_jobs:
         pdf_path = job["pdf"]
@@ -713,7 +806,6 @@ if __name__ == "__main__":
         all_results[pdf_path] = result
         print(f"\n=== Result for {pdf_path} ===")
         print(json.dumps(result, ensure_ascii=False, indent=2))
-
     with open("all_results.json", "w", encoding="utf-8") as f:
         json.dump(all_results, f, ensure_ascii=False, indent=2)
     print("\nAll results saved to 'all_results.json'")
